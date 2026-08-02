@@ -1,11 +1,26 @@
 import os
 import time
+import threading
 import requests
 import pandas as pd
 import numpy as np
 import yfinance as yf
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
+from flask import Flask
+
+# ==============================================================================
+# PETIT SERVEUR WEB POUR RENDRE LE BOT COMPATIBLE WEB SERVICE GRATUIT
+# ==============================================================================
+app = Flask(__name__)
+
+@app.route('/')
+def health_check():
+    return "Bot Strategic Vision en ligne 🚀", 200
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
 
 # ==============================================================================
 # CONFIGURATION TELEGRAM & ENVIRONNEMENT
@@ -27,7 +42,6 @@ def send_telegram_signal(message):
         print(f"Erreur d'envoi Telegram : {e}")
 
 def format_price(symbol, price):
-    """Formatage dynamique des prix selon la classe d'actif."""
     if price is None:
         return "0.00"
     if any(k in symbol for k in ["BTC", "ETH", "BITCOIN", "ETHEREUM", "NASDAQ", "US30", "SP500", "GOLD", "SILVER"]):
@@ -35,7 +49,7 @@ def format_price(symbol, price):
     return f"{price:.5f}"
 
 # ==============================================================================
-# PANIER D'ACTIFS — TICKERS STABLES YAHOO FINANCE (2-2-2-2)
+# PANIER D'ACTIFS
 # ==============================================================================
 SYMBOLS = {
     "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X",
@@ -90,7 +104,7 @@ def fetch_multi_tf_data(ticker):
     return dfs
 
 # ==============================================================================
-# ÉTAT PERSISTANT AMD
+# ÉTAT AMD & LOGIQUE SMC
 # ==============================================================================
 asia_ranges = {}          
 london_manipulation = {}  
@@ -130,11 +144,7 @@ def is_generic_cascade_window(symbol, now_utc):
     london_h = london_local.hour + london_local.minute / 60
     ny_h = ny_local.hour + ny_local.minute / 60
 
-    if 7.0 <= london_h < 10.0:
-        return True
-    elif 7.5 <= ny_h < 10.5:
-        return True
-    elif 10.5 <= ny_h < 12.5: 
+    if 7.0 <= london_h < 10.0 or 7.5 <= ny_h < 10.5 or 10.5 <= ny_h < 12.5:
         return True
     elif 0.0 <= utc_h < 5.0 and any(k in symbol for k in ["JPY", "AUD", "NZD"]):
         return True
@@ -164,16 +174,10 @@ def update_asia_range(symbol, df_m15, dt_utc):
     else:
         asia_ranges[key] = {"high": high, "low": low}
 
-# ==============================================================================
-# DÉTECTION MANIPULATION & DISTRIBUTION
-# ==============================================================================
 def detect_manipulation(df_m15, level_high, level_low):
     if df_m15 is None or len(df_m15) < 6 or level_high is None:
         return None
-    highs = df_m15['high'].values
-    lows = df_m15['low'].values
-    closes = df_m15['close'].values
-    opens = df_m15['open'].values
+    highs, lows, closes, opens = df_m15['high'].values, df_m15['low'].values, df_m15['close'].values, df_m15['open'].values
 
     sweep_buy = lows[-1] < level_low and closes[-1] > level_low
     sweep_sell = highs[-1] > level_high and closes[-1] < level_high
@@ -202,15 +206,10 @@ def detect_distribution(df_m15, expected_direction):
     else:
         return ema15 < ema40 and df_m15['close'].iloc[-1] < df_m15['open'].iloc[-1]
 
-# ==============================================================================
-# SMT DIVERGENCE CORRIGÉE
-# ==============================================================================
 def check_smt_divergence_correct(direction, partner_symbol, partner_dfs, dt_utc):
-    """Vérifie la SMT en calculant le range propre du partenaire."""
     partner_m15 = partner_dfs.get("M15", pd.DataFrame())
     if partner_m15.empty:
         return False
-    
     partner_key = day_key(partner_symbol, dt_utc)
     partner_rng = asia_ranges.get(partner_key)
     if not partner_rng:
@@ -224,9 +223,6 @@ def check_smt_divergence_correct(direction, partner_symbol, partner_dfs, dt_utc)
     else:
         return p_high_last < partner_rng["high"]
 
-# ==============================================================================
-# ÉVALUATEUR FRACTAL SMC
-# ==============================================================================
 def evaluate_fractal_layer(df_htf, df_itf, df_ltf, level_label):
     if df_htf.empty or df_itf.empty or df_ltf.empty:
         return None, None, None, None, None, None
@@ -285,44 +281,25 @@ def evaluate_fractal_layer(df_htf, df_itf, df_ltf, level_label):
     return None, None, None, None, None, None
 
 def analyze_symbol_cascade(dfs):
-    df_d1 = dfs.get("D1", pd.DataFrame())
-    df_h4 = dfs.get("H4", pd.DataFrame())
-    df_h1 = dfs.get("H1", pd.DataFrame())
-    df_m15 = dfs.get("M15", pd.DataFrame())
-    df_m5 = dfs.get("M5", pd.DataFrame())
-    df_m1 = dfs.get("M1", pd.DataFrame())
-
-    res = evaluate_fractal_layer(df_d1, df_h1, df_m5, "SWING: D1/H1/M5")
-    if res[0]:
-        return res
-    res = evaluate_fractal_layer(df_h4, df_m15, df_m5, "INTRADAY: H4/M15/M5")
-    if res[0]:
-        return res
-    res = evaluate_fractal_layer(df_h1, df_m5, df_m1, "SCALPING: H1/M5/M1")
-    if res[0]:
-        return res
+    for htf, itf, ltf, lbl in [("D1", "H1", "M5", "SWING"), ("H4", "M15", "M5", "INTRADAY"), ("H1", "M5", "M1", "SCALPING")]:
+        res = evaluate_fractal_layer(dfs.get(htf, pd.DataFrame()), dfs.get(itf, pd.DataFrame()), dfs.get(ltf, pd.DataFrame()), lbl)
+        if res[0]:
+            return res
     return None, None, None, None, None, None
 
 # ==============================================================================
-# ENVOI DES SIGNAUX (TELEGRAM)
+# ENVOI DES SIGNAUX TELEGRAM
 # ==============================================================================
 def send_amd_signal(symbol, direction, phase_label, df_m15, now_utc):
     signal_id = f"{symbol}_{phase_label}_{direction}_{df_m15.index[-1]}"
     if signal_id in sent_signals:
         return
     sent_signals.add(signal_id)
-    if len(sent_signals) > MAX_SENT_SIGNALS:
-        sent_signals.clear()
 
     price = float(df_m15['close'].iloc[-1])
-    if direction == "BUY":
-        sl = float(df_m15['low'].iloc[-3:].min())
-        risk = price - sl
-        tp = price + risk * 2.5
-    else:
-        sl = float(df_m15['high'].iloc[-3:].max())
-        risk = sl - price
-        tp = price - risk * 2.5
+    sl = float(df_m15['low'].iloc[-3:].min()) if direction == "BUY" else float(df_m15['high'].iloc[-3:].max())
+    risk = abs(price - sl)
+    tp = price + risk * 2.5 if direction == "BUY" else price - risk * 2.5
 
     smt_tag = ""
     partner = SMT_PARTNER.get(symbol)
@@ -330,9 +307,9 @@ def send_amd_signal(symbol, direction, phase_label, df_m15, now_utc):
         try:
             partner_dfs = fetch_multi_tf_data(SYMBOLS[partner])
             if check_smt_divergence_correct(direction, partner, partner_dfs, now_utc):
-                smt_tag = f"\n🔗 <b>SMT confirmée :</b> {partner} n'a pas suivi (Divergence institutionnelle)"
+                smt_tag = f"\n🔗 <b>SMT confirmée :</b> {partner} n'a pas suivi (Divergence)"
         except Exception as e:
-            print(f"Erreur SMT pour {symbol}: {e}")
+            print(f"Erreur SMT : {e}")
 
     msg = (
         f"🏛️ <b>SIGNAL AMD — {phase_label}</b> 🏛️\n\n"
@@ -350,12 +327,9 @@ def send_generic_signal(symbol, direction, config, price, sl, tp, candle_id):
     if signal_id in sent_signals:
         return
     sent_signals.add(signal_id)
-    if len(sent_signals) > MAX_SENT_SIGNALS:
-        sent_signals.clear()
 
     risk = abs(price - sl)
-    tp_rr = price + (risk * 2.5) if direction == "BUY" else price - (risk * 2.5)
-    tp_final = tp if tp != 0 else tp_rr
+    tp_final = tp if tp != 0 else (price + (risk * 2.5) if direction == "BUY" else price - (risk * 2.5))
 
     msg = (
         f"🚨 <b>SIGNAL TRADITIONNEL SMC</b> 🚨\n\n"
@@ -369,10 +343,10 @@ def send_generic_signal(symbol, direction, config, price, sl, tp, candle_id):
     send_telegram_signal(msg)
 
 # ==============================================================================
-# BOUCLE PRINCIPALE
+# BOUCLE DU BOT DE TRADING
 # ==============================================================================
 def run_bot():
-    send_telegram_signal("⚡ <b>Bot Traditionnel AMD + SMT + Fractalité en ligne !</b>")
+    send_telegram_signal("⚡ <b>Bot Traditionnel AMD + SMT + Fractalité en ligne (Web Service Free) !</b>")
 
     while True:
         try:
@@ -388,7 +362,6 @@ def run_bot():
 
                     if window == "ASIA":
                         update_asia_range(symbol_name, df_m15, now_utc)
-
                     elif window == "LONDON":
                         rng = asia_ranges.get(key)
                         if rng:
@@ -396,7 +369,6 @@ def run_bot():
                             if direction:
                                 london_manipulation[key] = direction
                                 send_amd_signal(symbol_name, direction, "MANIPULATION (Londres)", df_m15, now_utc)
-
                     elif window == "NY":
                         expected = london_manipulation.get(key)
                         if expected and detect_distribution(df_m15, expected):
@@ -409,17 +381,20 @@ def run_bot():
 
                 except Exception as e:
                     print(f"Erreur d'analyse sur {symbol_name}: {e}")
-                    continue
 
         except Exception as e:
             print(f"Erreur globale Boucle: {e}")
 
         time.sleep(180)
 
+# ==============================================================================
+# POINT D'ENTRÉE DU SCRIPT
+# ==============================================================================
 if __name__ == "__main__":
-    while True:
-        try:
-            run_bot()
-        except Exception as e:
-            print(f"Redémarrage automatique du script: {e}")
-            time.sleep(30)
+    # Lancement du serveur Web Flask dans un thread séparé
+    t = threading.Thread(target=run_flask)
+    t.daemon = True
+    t.start()
+
+    # Lancement de la boucle du bot
+    run_bot()
